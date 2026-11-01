@@ -36,7 +36,12 @@ typedef struct {
     uint16_t sport, dport;  /* host order */
 } vh_tuple;
 
-typedef void (*vh_verdict_fn)(const vh_tuple *flow, vh_reason reason, void *user);
+/*
+ * Returns 0 if the verdict could not be carried out yet: the kernel has no conntrack entry until the
+ * connection's first packet has left the hook, and may never have one if a string rule dropped it.
+ * The engine asks again on the connection's next packet.
+ */
+typedef int (*vh_verdict_fn)(const vh_tuple *flow, vh_reason reason, void *user);
 
 #define VH_TOP_PORTS 64
 

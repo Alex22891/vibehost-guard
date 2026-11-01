@@ -42,6 +42,8 @@ typedef struct flow {
     uint32_t last_packet;               /* hash of the last copy */
     uint16_t packets;
     char hook;
+    uint8_t pending;                    /* blocked, but not carried out yet */
+    uint8_t reason;
 } flow;
 
 typedef struct {
@@ -382,7 +384,8 @@ static int parse(vh_engine *e, const uint8_t *in, size_t len, parsed *out, const
 
 static void block(vh_engine *e, flow *f, vh_reason reason) {
     e->stats.reasons[reason]++;
-    if (e->fn) e->fn(&f->tuple, reason, e->user);
+    f->reason = (uint8_t) reason;
+    f->pending = e->fn && !e->fn(&f->tuple, reason, e->user);
     finish(e, f);
 }
 
@@ -449,7 +452,10 @@ void vh_engine_packet(vh_engine *e, const uint8_t *packet, size_t len, char hook
     flow *f = flow_get(e, &in.tuple, hook, now_ms, &created);
     if (!f) return;
     f->last_ms = now_ms;
-    if (!f->analysis) return;
+    if (!f->analysis) {
+        if (f->pending && e->fn(&f->tuple, (vh_reason) f->reason, e->user)) f->pending = 0;
+        return;
+    }
     /* A docker packet passes the rule twice, from FORWARD and DOCKER-USER; the library must see it once. */
     uint32_t seen = mix(l3, l3_len, 2166136261u);
     if (!created && seen == f->last_packet) return;

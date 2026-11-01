@@ -16,13 +16,14 @@
 
 #include "engine.h"
 
-static void on_verdict(const vh_tuple *t, vh_reason reason, void *user) {
+static int on_verdict(const vh_tuple *t, vh_reason reason, void *user) {
     (void) user;
     char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
     inet_ntop(t->family, t->src, src, sizeof src);
     inet_ntop(t->family, t->dst, dst, sizeof dst);
     printf("verdict %s %s %s:%u %s:%u\n", vh_reason_name(reason), t->proto == IPPROTO_TCP ? "tcp" : "udp",
            src, t->sport, dst, t->dport);
+    return 1;
 }
 
 /* Offset of the IP header, or -1. */

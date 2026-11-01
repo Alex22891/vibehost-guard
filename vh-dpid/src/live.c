@@ -100,23 +100,24 @@ static int mark_with(const vh_tuple *t, int attr, int swap) {
  * The copy shows a forwarded packet after DNAT and before SNAT, so the addresses we saw may be the
  * connection's original tuple or its reply tuple, in either direction.
  */
-static void mark_flow(const vh_tuple *t) {
+static int mark_flow(const vh_tuple *t) {
     static const struct { int attr; int swap; } tries[] = {
         {CTA_TUPLE_ORIG, 0}, {CTA_TUPLE_ORIG, 1}, {CTA_TUPLE_REPLY, 0}, {CTA_TUPLE_REPLY, 1},
     };
     for (size_t i = 0; i < sizeof tries / sizeof tries[0]; i++) {
         if (mark_with(t, tries[i].attr, tries[i].swap) == 0) {
             marked++;
-            return;
+            return 1;
         }
     }
     mark_failed++;
+    return 0;
 }
 
-static void on_verdict(const vh_tuple *t, vh_reason reason, void *user) {
+static int on_verdict(const vh_tuple *t, vh_reason reason, void *user) {
     (void) reason;
     (void) user;
-    if (enforce) mark_flow(t);
+    return enforce ? mark_flow(t) : 1;
 }
 
 /* ---- the stats file guard.sh reports: counts and port numbers, never an address ---- */
