@@ -16,10 +16,12 @@ COPY src /src
 WORKDIR /src
 ENV NDPI_FLAGS="-I/nDPI/src/include -I/nDPI/src/lib/third_party/include"
 RUN gcc -O2 -Wall -Wextra -Werror $NDPI_FLAGS -c engine.c -o engine.o \
+    && gcc -O2 -Wall -Wextra -Werror -c scan.c -o scan.o \
+    && gcc -O2 -Wall -Wextra -Werror scan.o scan_test.c -o scan-test && ./scan-test \
     && gcc -O2 -Wall -Wextra -Werror -c live.c -o live.o \
     && gcc -O2 -Wall -Wextra -Werror -c replay.c -o replay.o \
-    && gcc -static -s engine.o live.o -o vh-dpid /nDPI/src/lib/libndpi.a -lmnl -lm -lpthread \
-    && gcc engine.o replay.o -o vh-dpid-replay /nDPI/src/lib/libndpi.a -lpcap -lm -lpthread \
+    && gcc -static -s engine.o scan.o live.o -o vh-dpid /nDPI/src/lib/libndpi.a -lmnl -lm -lpthread \
+    && gcc engine.o scan.o replay.o -o vh-dpid-replay /nDPI/src/lib/libndpi.a -lpcap -lm -lpthread \
     && mkdir -p /dist && cp vh-dpid /dist/ && cp /nDPI/COPYING /dist/COPYING.nDPI \
     && gzip -9 -k -c vh-dpid > /dist/vh-dpid.gz
 

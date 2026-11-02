@@ -16,6 +16,21 @@ It stores no payload and sends none anywhere. What leaves the server is counts a
 
 TLS, QUIC and DNS are never judged.
 
+## Scans
+
+The same copies show outbound port scans. A try is a TCP SYN leaving the server, or leaving a private address
+behind it (a VPN user, a container); its answer is a SYN-ACK or a reset coming back. A reset, or no answer in
+3 seconds, is a failure. A source with failures to 100 different addresses, or 200 different address:port
+pairs, within a minute is a scanner for the next 15 minutes, but only if at least half of its tries in that
+minute failed. A proxy or a VPN whose users all leave from the server's own address fails a few hundred tries a
+minute as well, but among thousands that are answered, so it is not a scanner. Inbound tries, and tries from
+public addresses routed through the server, are not ours to judge.
+
+With `--scan <file>` the scanners are written to that file, one per line: `src <address> <until>` for a VPN
+user or a container, `port <n> <until>` for a port the server itself scanned (never 53, 80, 123, 443, 853),
+`<until>` in Unix seconds. `guard.sh` blocks them only when VibeHost sets the scan mode to `block`. The stats
+file carries `scanFailed`, `scanEvents`, `scanActive` and `scanPorts`: counts and port numbers, no address.
+
 ## Build
 
 ```sh
@@ -23,7 +38,8 @@ docker buildx build --platform linux/amd64 --target out -o out/amd64 .
 docker buildx build --platform linux/arm64 --target out -o out/arm64 .
 ```
 
-`out/<arch>/vh-dpid.gz` is what servers download; its SHA-256 goes into `guard.sh`.
+`out/<arch>/vh-dpid.gz` is what servers download; its SHA-256 goes into `guard.sh`. The build runs
+`scan_test.c`, the scan watch on made-up traffic, and fails if it does.
 
 ## Tests
 

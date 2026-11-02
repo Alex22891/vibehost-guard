@@ -73,6 +73,10 @@ void vh_engine_packet(vh_engine *e, const uint8_t *packet, size_t len, char hook
 void vh_engine_sweep(vh_engine *e, uint64_t now_ms);
 
 const vh_stats *vh_engine_stats(const vh_engine *e);
+
+/* The scan watch that sees the same copies (scan.h). */
+struct vh_scan;
+const struct vh_scan *vh_engine_scan(const vh_engine *e);
 const char *vh_reason_name(vh_reason r);
 
 /* Exposed for tests: whether a payload carries the protocol's own bytes in the right place. */

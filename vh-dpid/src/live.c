@@ -3,7 +3,11 @@
  * mark on a connection the engine judged BitTorrent; a rule of guard.sh drops what carries the bit.
  * Traffic never waits for this process: if it stops, nothing changes on the network.
  *
- *   vh-dpid --mode shadow|enforce --stats <file>
+ *   vh-dpid --mode shadow|enforce --stats <file> [--scan <file>]
+ *
+ * With --scan it also keeps <file> listing the sources it judged to be scanning, for guard.sh to block
+ * when VibeHost says so: "src <address> <until>" for a VPN user or a container, "port <n> <until>" for a
+ * port the server itself scanned (never a web, DNS or time port), <until> in Unix seconds.
  *
  * Exit codes: 3 - this kernel cannot do it (no nfnetlink_log, no ctnetlink, not allowed).
  *
@@ -26,6 +30,7 @@
 #include <unistd.h>
 
 #include "engine.h"
+#include "scan.h"
 
 #define NFLOG_GROUP 4711
 /* The rule copies VH_TAP_BYTES; this is its room in the netlink message. */
@@ -40,6 +45,8 @@ static int enforce;
 static struct mnl_socket *ct_sock;
 static unsigned int ct_portid, ct_seq;
 static uint64_t marked, mark_failed;
+static const char *scan_path;
+static uint64_t scan_written = UINT64_MAX;
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -139,6 +146,41 @@ static void write_ports(FILE *f, const char *name, const vh_port_count *table) {
     fputc('}', f);
 }
 
+/* ---- the scanners guard.sh may block ---- */
+
+#define MAX_SCANNERS 256
+
+/* A port the server must keep reaching whatever it did: web, DNS, time. */
+static int vital_port(uint16_t p) {
+    return p == 53 || p == 80 || p == 123 || p == 443 || p == 853;
+}
+
+static void write_scan(const vh_engine *e, uint64_t now) {
+    if (!scan_path) return;
+    static vh_scanner list[MAX_SCANNERS];
+    uint64_t version;
+    size_t n = vh_scan_list(vh_engine_scan(e), list, MAX_SCANNERS, &version);
+    if (version == scan_written) return;
+    char tmp[512];
+    if (snprintf(tmp, sizeof tmp, "%s.tmp", scan_path) >= (int) sizeof tmp) return;
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    long long wall = (long long) time(NULL);
+    for (size_t i = 0; i < n; i++) {
+        long long until = wall + (long long) ((list[i].until_ms - now) / 1000);
+        if (!list[i].local) {
+            char addr[INET6_ADDRSTRLEN];
+            if (inet_ntop(list[i].family, list[i].addr, addr, sizeof addr)) fprintf(f, "src %s %lld\n", addr, until);
+            continue;
+        }
+        for (int k = 0; k < list[i].nports; k++) {
+            if (!vital_port(list[i].ports[k])) fprintf(f, "port %u %lld\n", list[i].ports[k], until);
+        }
+    }
+    fclose(f);
+    if (rename(tmp, scan_path) == 0) scan_written = version;
+}
+
 static void write_stats(const char *path, const vh_engine *e, uint64_t lost) {
     char tmp[512];
     if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int) sizeof tmp) return;
@@ -157,6 +199,12 @@ static void write_stats(const char *path, const vh_engine *e, uint64_t lost) {
             (unsigned long long) marked, (unsigned long long) mark_failed);
     write_ports(f, "strongPorts", s->strong_ports);
     write_ports(f, "weakPorts", s->weak_ports);
+    static vh_scanner active[MAX_SCANNERS];
+    const vh_scan_stats *sc = vh_scan_stats_of(vh_engine_scan(e));
+    fprintf(f, ",\"scanFailed\":%llu,\"scanEvents\":%llu,\"scanActive\":%zu",
+            (unsigned long long) sc->failed, (unsigned long long) sc->events,
+            vh_scan_list(vh_engine_scan(e), active, MAX_SCANNERS, NULL));
+    write_ports(f, "scanPorts", sc->ports);
     fclose(f);
     rename(tmp, path);
 }
@@ -235,9 +283,10 @@ int main(int argc, char **argv) {
     for (int i = 1; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--mode")) enforce = !strcmp(argv[i + 1], "enforce");
         else if (!strcmp(argv[i], "--stats")) stats_path = argv[i + 1];
+        else if (!strcmp(argv[i], "--scan")) scan_path = argv[i + 1];
     }
     if (!stats_path) {
-        fprintf(stderr, "usage: vh-dpid --mode shadow|enforce --stats <file>\n");
+        fprintf(stderr, "usage: vh-dpid --mode shadow|enforce --stats <file> [--scan <file>]\n");
         return 2;
     }
     signal(SIGTERM, on_signal);
@@ -282,6 +331,7 @@ int main(int argc, char **argv) {
         }
         if (r.now >= next_sweep) {
             vh_engine_sweep(engine, r.now);
+            write_scan(engine, r.now);
             next_sweep = r.now + SWEEP_EVERY_MS;
         }
         if (r.now >= next_stats) {

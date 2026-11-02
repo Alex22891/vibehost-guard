@@ -1,8 +1,8 @@
 #!/bin/sh
-# Torrent guard. Usage: guard.sh <code> | apply | tick
+# Torrent guard. Usage: guard.sh <code> | apply | tick | scan
 set -u
 
-VERSION=4
+VERSION=6
 API="${VH_GUARD_API:-https://api.vibehost.net/api/v1/guard}"
 LIB=/usr/local/lib/vibehost-guard
 CONF_DIR=/etc/vibehost-guard
@@ -13,11 +13,15 @@ DPI_BIN="$LIB/vh-dpid"
 DPI_RUN=/run/vibehost-guard-dpid
 DPI_STATS="$DPI_RUN/stats"
 DPI_PID="$DPI_RUN/pid"
+SCAN_LIST="$DPI_RUN/scan"
+SCAN_MODE_FILE="$CONF_DIR/scan.mode"
+SCAN_CHAIN=VH_GUARD_SCAN
+SCAN_VITAL=' 53 80 123 443 853 '
 DPI_BIT=0x100000
 DPI_PACKETS=12
 DPI_BYTES=512
-DPI_SHA_AMD64=8935376c89bb30e71dd4a09e32c1e903f0a8ff3f4bcb03025febb4da4bbe4547
-DPI_SHA_ARM64=ed8b87ce1d10102e62fda6fb03b3d158ba5e111e291e688b8c2b45a8024be851
+DPI_SHA_AMD64=9c8eac1a1b291097f56adc4c8eca97c7b40566616436ae80c2f72176b9566877
+DPI_SHA_ARM64=794d2fa85593d6390c508d29fe55ea6672979dc2b6d84beabea28fbde0164bcc
 
 SIGNATURES='bt-handshake|BitTorrent protocol
 dht-query|d1:ad2:id20:
@@ -78,6 +82,9 @@ apply_dpi_rules() {
 apply_table() {
     t=$1
     $t -w -N $CHAIN 2>/dev/null || $t -w -F $CHAIN || return 1
+    $t -w -N $SCAN_CHAIN 2>/dev/null || $t -w -F $SCAN_CHAIN || return 1
+    $t -w -A $CHAIN -m comment --comment vhscan -j $SCAN_CHAIN || return 1
+    scan_fill "$t"
     apply_dpi_rules "$t" || return 1
     $t -w -A $CHAIN -m connbytes --connbytes 4097: --connbytes-dir both --connbytes-mode bytes -j RETURN || return 1
     signatures "$t" | while IFS='|' read -r name pattern; do
@@ -106,6 +113,7 @@ hook_table() {
 
 intact_table() {
     t=$1
+    [ "$($t -w -S $CHAIN 2>/dev/null | grep -c -- "-j $SCAN_CHAIN")" -eq 1 ] || return 1
     want=$(signatures "$t" | grep -c '|')
     have=$($t -w -S $CHAIN 2>/dev/null | grep -c -- '--comment "\{0,1\}vh:')
     [ "$have" -eq $((want + 1)) ] || return 1
@@ -149,9 +157,91 @@ apply() {
 ensure() {
     rc=0
     for t in $(tables); do
-        intact_table "$t" || apply_table "$t" || rc=1
+        if intact_table "$t"; then
+            scan_fill "$t"
+        else
+            apply_table "$t" || rc=1
+        fi
     done
     return $rc
+}
+
+scan_mode() {
+    m=detect
+    [ -r "$SCAN_MODE_FILE" ] && m=$(cat "$SCAN_MODE_FILE" 2>/dev/null)
+    case "$m" in off|detect|block) echo "$m" ;; *) echo detect ;; esac
+}
+
+scan_fill() {
+    t=$1
+    $t -w -F $SCAN_CHAIN 2>/dev/null || return 0
+    [ "$(scan_mode)" = block ] && [ -r "$SCAN_LIST" ] || return 0
+    now=$(date +%s)
+    n=0
+    while read -r kind value until; do
+        [ "$n" -lt 256 ] || break
+        case "$until" in ''|*[!0-9]*) continue ;; esac
+        [ "$until" -gt "$now" ] || continue
+        case "$kind" in
+            src)
+                case "$value" in
+                    *:*) [ "$t" = ip6tables ] || continue
+                         case "$value" in *[!0-9a-fA-F:]*) continue ;; esac ;;
+                    *) [ "$t" = iptables ] || continue
+                       case "$value" in *[!0-9.]*|'') continue ;; esac ;;
+                esac
+                $t -w -A $SCAN_CHAIN -s "$value" -m conntrack --ctstate NEW \
+                    -m comment --comment vhscan-src -j DROP 2>/dev/null && n=$((n + 1))
+                ;;
+            port)
+                case "$value" in ''|*[!0-9]*) continue ;; esac
+                [ "$value" -ge 1 ] && [ "$value" -le 65535 ] || continue
+                case "$SCAN_VITAL" in *" $value "*) continue ;; esac
+                $t -w -A $SCAN_CHAIN -p tcp --syn --dport "$value" -m addrtype --src-type LOCAL \
+                    -m comment --comment vhscan-port -j DROP 2>/dev/null && n=$((n + 1))
+                ;;
+        esac
+    done < "$SCAN_LIST"
+    return 0
+}
+
+scan_sync() {
+    for t in $(tables); do
+        if $t -w -n -L $SCAN_CHAIN >/dev/null 2>&1; then scan_fill "$t"; else ensure; fi
+    done
+}
+
+scan_rules() {
+    for t in $(tables); do
+        $t -w -S $SCAN_CHAIN 2>/dev/null
+    done | grep -c -- '-j DROP'
+}
+
+scan_write_units() {
+    cat > /etc/systemd/system/vibehost-guard-scan.path <<EOF
+[Unit]
+Description=VibeHost guard: the analyser's list of scanners changed
+
+[Path]
+PathModified=$SCAN_LIST
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    cat > /etc/systemd/system/vibehost-guard-scan.service <<EOF
+[Unit]
+Description=VibeHost guard: block or release scanners
+
+[Service]
+Type=oneshot
+ExecStart=$LIB/guard.sh scan
+EOF
+}
+
+scan_remove_units() {
+    [ -f /etc/systemd/system/vibehost-guard-scan.path ] || return 0
+    systemctl disable --now vibehost-guard-scan.path >/dev/null 2>&1
+    rm -f /etc/systemd/system/vibehost-guard-scan.path /etc/systemd/system/vibehost-guard-scan.service
 }
 
 counters() {
@@ -160,7 +250,6 @@ counters() {
     done | awk '/vh:/ { for (i = 1; i <= NF; i++) if ($i ~ /^vh:/) { n[substr($i, 4)] += $1 } }
         END { s = ""; for (k in n) { s = s (s == "" ? "" : ",") "\"" k "\":" n[k] }; print s }'
 }
-
 
 dpi_mode() {
     m=off
@@ -219,7 +308,7 @@ Description=VibeHost torrent guard analyser
 After=network-pre.target vibehost-guard.service
 
 [Service]
-ExecStart=$DPI_BIN --mode $1 --stats $DPI_STATS
+ExecStart=$DPI_BIN --mode $1 --stats $DPI_STATS --scan $SCAN_LIST
 Restart=on-failure
 RestartSec=30
 RestartPreventExitStatus=2 3
@@ -258,7 +347,7 @@ dpi_stop() {
         kill "$(cat "$DPI_PID")" 2>/dev/null
         rm -f "$DPI_PID"
     fi
-    rm -f "$DPI_STATS"
+    rm -f "$DPI_STATS" "$SCAN_LIST"
 }
 
 dpi_start() {
@@ -268,12 +357,18 @@ dpi_start() {
     fi
     if dpi_systemd; then
         dpi_write_unit "$1"
+        scan_write_units
         systemctl daemon-reload
         systemctl enable vibehost-guard-dpid.service >/dev/null 2>&1
         systemctl restart vibehost-guard-dpid.service >/dev/null 2>&1
+        systemctl enable --now vibehost-guard-scan.path >/dev/null 2>&1
     else
         mkdir -p "$DPI_RUN"
-        nohup "$DPI_BIN" --mode "$1" --stats "$DPI_STATS" >/dev/null 2>&1 9>&- &
+        if [ -r "$DPI_PID" ] && kill "$(cat "$DPI_PID")" 2>/dev/null; then
+            n=0
+            while kill -0 "$(cat "$DPI_PID")" 2>/dev/null && [ $n -lt 10 ]; do sleep 1; n=$((n + 1)); done
+        fi
+        nohup "$DPI_BIN" --mode "$1" --stats "$DPI_STATS" --scan "$SCAN_LIST" >/dev/null 2>&1 9>&- &
         echo $! > "$DPI_PID"
     fi
 }
@@ -292,6 +387,7 @@ dpi_sync() {
         if dpi_systemd && [ -f /etc/systemd/system/vibehost-guard-dpid.service ]; then
             systemctl disable vibehost-guard-dpid.service >/dev/null 2>&1
             dpi_stop
+            scan_remove_units
             rm -f /etc/systemd/system/vibehost-guard-dpid.service
             systemctl daemon-reload
         elif ! dpi_systemd; then
@@ -455,7 +551,7 @@ tick() {
     ok=true
     ensure || ok=false
     [ -n "$VIBEHOST_GUARD_TOKEN" ] || return 0
-    body="{\"version\":$VERSION,\"rulesOk\":$ok,\"os\":\"$(os_name)\",\"counters\":{$(counters)},\"dpi\":{$(dpi_report)}}"
+    body="{\"version\":$VERSION,\"rulesOk\":$ok,\"os\":\"$(os_name)\",\"counters\":{$(counters)},\"dpi\":{$(dpi_report)},\"scan\":{\"mode\":\"$(scan_mode)\",\"rules\":$(scan_rules)}}"
     answer=$(post "$API/heartbeat" "$body" "$VIBEHOST_GUARD_TOKEN") || return 0
     wanted=$(echo "$answer" | json_field dpi)
     case "$wanted" in off|shadow|enforce)
@@ -465,6 +561,15 @@ tick() {
             dpi_sync </dev/null || true
             [ "$wanted" = off ] || sleep 6
             ensure || true
+        fi
+        ;;
+    esac
+    scan=$(echo "$answer" | json_field scan)
+    case "$scan" in off|detect|block)
+        if [ "$scan" != "$(scan_mode)" ]; then
+            mkdir -p "$CONF_DIR"
+            echo "$scan" > "$SCAN_MODE_FILE"
+            scan_sync
         fi
         ;;
     esac
@@ -481,5 +586,6 @@ tick() {
 case "${1:-}" in
     apply) lock; apply ;;
     tick) lock; tick ;;
+    scan) lock; scan_sync ;;
     *) lock; install_guard "${1:-}" ;;
 esac

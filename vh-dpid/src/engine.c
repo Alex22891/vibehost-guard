@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include "ndpi_api.h"
+#include "scan.h"
 
 #define FLOW_BUCKETS (1u << 16)
 #define MAX_FLOWS 65536u
@@ -64,6 +65,7 @@ struct vh_engine {
     uint32_t flow_count;
     uint32_t analysed;
     memory peers, sources, udp_ports;
+    vh_scan *scan;
     vh_stats stats;
     uint8_t scratch[VH_TAP_BYTES];
 };
@@ -283,6 +285,7 @@ static flow *flow_get(vh_engine *e, const vh_tuple *t, char hook, uint64_t now_m
 }
 
 void vh_engine_sweep(vh_engine *e, uint64_t now_ms) {
+    vh_scan_tick(e->scan, now_ms);
     for (uint32_t i = 0; i < FLOW_BUCKETS; i++) {
         flow **link = &e->buckets[i];
         while (*link) {
@@ -303,6 +306,7 @@ void vh_engine_sweep(vh_engine *e, uint64_t now_ms) {
 
 typedef struct {
     vh_tuple tuple;
+    uint8_t tcp_flags;
     const uint8_t *payload;
     size_t payload_len;
 } parsed;
@@ -358,10 +362,12 @@ static int parse(vh_engine *e, const uint8_t *in, size_t len, parsed *out, const
     }
 
     out->tuple.proto = proto;
+    out->tcp_flags = 0;
     if (proto == IPPROTO_TCP) {
         if (len < off + 20) return -1;
         size_t hl = (size_t) (p[off + 12] >> 4) * 4;
         if (hl < 20 || len < off + hl) return -1;
+        out->tcp_flags = p[off + 13];
         out->payload = p + off + hl;
         out->payload_len = len - off - hl;
     } else if (proto == IPPROTO_UDP) {
@@ -447,6 +453,8 @@ void vh_engine_packet(vh_engine *e, const uint8_t *packet, size_t len, char hook
     size_t l3_len;
     e->stats.packets++;
     if (parse(e, packet, len, &in, &l3, &l3_len) != 0) return;
+    /* Before the flow table: a scan's thousands of one-packet tries must be seen even when it is full. */
+    vh_scan_packet(e->scan, &in.tuple, in.tcp_flags, hook, now_ms);
 
     int created;
     flow *f = flow_get(e, &in.tuple, hook, now_ms, &created);
@@ -524,7 +532,8 @@ vh_engine *vh_engine_new(vh_verdict_fn fn, void *user) {
     e->user = user;
     /* We are a for-profit project: only the LGPL dissectors, see README. */
     e->ndpi = ndpi_init_detection_module(NULL, NDPI_LICENSE_FOR_PROFIT_LGPL);
-    if (!e->ndpi || memory_init(&e->peers, PEER_SLOTS) || memory_init(&e->sources, SOURCE_SLOTS)
+    e->scan = vh_scan_new();
+    if (!e->ndpi || !e->scan || memory_init(&e->peers, PEER_SLOTS) || memory_init(&e->sources, SOURCE_SLOTS)
         || memory_init(&e->udp_ports, PORT_SLOTS)) {
         vh_engine_free(e);
         return NULL;
@@ -553,6 +562,7 @@ void vh_engine_free(vh_engine *e) {
         }
     }
     if (e->ndpi) ndpi_exit_detection_module(e->ndpi);
+    vh_scan_free(e->scan);
     free(e->peers.slots);
     free(e->sources.slots);
     free(e->udp_ports.slots);
@@ -561,6 +571,10 @@ void vh_engine_free(vh_engine *e) {
 
 const vh_stats *vh_engine_stats(const vh_engine *e) {
     return &e->stats;
+}
+
+const struct vh_scan *vh_engine_scan(const vh_engine *e) {
+    return e->scan;
 }
 
 const char *vh_reason_name(vh_reason r) {
